@@ -1,0 +1,15 @@
+# secrets / local config
+.env
+
+# virtualenv & tooling caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# downloaded/generated data (reproduce with: python3 one_file.py, --evaluate)
+data/
+results/
+
+# OS noise
+.DS_Store
