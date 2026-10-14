@@ -1,4 +1,6 @@
-# OIL MARKET AI — Beginner Prototype (one-file edition)
+# oil-market-news-analysis
+
+Exploring the relationship between financial news and crude oil price movements using Python and AI.
 
 A project folder kept as small as possible for learning + daily use:
 
