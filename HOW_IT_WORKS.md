@@ -454,7 +454,273 @@ Run them with `python3 -m pytest tests/ -v`.
 
 ---
 
-## 7. Why the results are honest (and modest)
+## 7. The statistical models, explained in depth
+
+This section explains every statistical model and calculation in the project, from raw prices to the printed probability. It is the "how does the maths actually work" part of the guide.
+
+The project uses **no deep learning**. Everything is classical statistics: simple summary numbers, one type of classifier (logistic regression), and standard measures of how good the predictions are. The news analysis uses a language model, which is covered separately in section 7.12.
+
+### 7.1 What kind of problem this is
+
+The question "up or down tomorrow?" is a **binary classification** problem. There are two outcomes, 1 (rose) or 0 (did not rise). The model does not just pick a side; it outputs a **probability** between 0 and 1. A probability is more useful than a yes/no answer because it shows how confident the model is.
+
+This is also **supervised learning**: the model learns from past examples where the outcome is already known.
+
+### 7.2 Step 1: turning prices into features
+
+Raw prices are not useful to a model on their own. A price of $80 means little without context. So the program converts prices into **features**, numbers that describe the recent market.
+
+**Returns.** The basic building block is the percentage change:
+
+```
+return_k(t) = P(t) / P(t - k) - 1
+```
+
+For example, if the price was 80 five days ago and is 82 today, `return_5d = 82 / 80 - 1 = 0.025`, or +2.5%. In code this is `close.pct_change(k)`.
+
+**Volatility.** Volatility measures how jumpy recent prices are. It is the **sample standard deviation** of the last 10 one-day returns:
+
+```
+vol_10d(t) = sqrt( sum over the last 10 days of (r_i - mean_r)^2 / 9 )
+```
+
+The divisor is 9 (one less than 10) because this is a sample, not the whole population. Pandas does this by default. In code: `ret.rolling(10).std()`.
+
+**Moving-average distance** (rich set). `close / close.rolling(20).mean() - 1` measures how far today's price sits above (positive) or below (negative) its 20-day average. A common trading idea is that prices tend to drift back toward their average. This is a hypothesis the model can test, not a fact.
+
+**Position in range** (rich set). `(close - min20) / (max20 - min20)` gives a number between 0 and 1. It is 0 when today's price is the lowest of the last 20 days and 1 when it is the highest.
+
+**Volume z-score** (rich set). `volume / average_volume_20 - 1`. Positive values mean unusually heavy trading.
+
+Each feature is computed **using only past data**. None of them peek at tomorrow.
+
+The **basic** set has 3 features. The **rich** set has 12 features. More features give the model more to work with, but also more chances to fit noise.
+
+### 7.3 Step 2: the target (what we predict)
+
+```
+y(t) = 1   if  P(t+1) > P(t)
+y(t) = 0   otherwise (fell or stayed flat)
+```
+
+The target uses tomorrow's price, which is the thing we want to forecast. That is why the last row of data has no target and is dropped before training.
+
+About half the days are up and half are down, so the two outcomes are close to balanced. This matters for the baseline (section 7.10).
+
+### 7.4 Step 3: standardization (the StandardScaler)
+
+Features live on different scales. A 10-day volatility might be `0.01`, while a volume z-score might be `2.3`. Regularization (section 7.5) penalises large weights, and a feature on a bigger scale would get a smaller weight for the same effect. To make the comparison fair, each feature is standardized:
+
+```
+z = (x - mu) / sigma
+```
+
+where `mu` is the average and `sigma` is the standard deviation of that feature.
+
+The key rule: **`mu` and `sigma` are learned from the training data only.** The `StandardScaler` sits inside the pipeline, so when the model fits on the training block, it learns the training averages. Validation and test data are then transformed using those same numbers. If the scaler saw the test data, the test would leak information.
+
+The one exception is the final forecast. After the winner is chosen, the whole pipeline is refitted on all history (section 7.7), so the scaler's averages and spreads are then recalculated from all the data. This is safe because the forecast is for a day that comes after all of that data.
+
+After standardizing, a value of `z = 0` means "average" and `z = 2` means "two typical steps above average."
+
+### 7.5 Step 4: logistic regression (the model itself)
+
+**The model.** Logistic regression computes a weighted sum of the standardized features, then squeezes it into a probability:
+
+```
+score = b + w1*z1 + w2*z2 + ... + wk*zk
+probability_up = 1 / (1 + e^(-score))
+```
+
+- `w1 ... wk` are the **weights** (coefficients). The model learns them.
+- `b` is the **intercept**. It is the starting score before any feature is considered.
+- The function `1 / (1 + e^(-score))` is the **sigmoid** (or logistic) function. It turns any number, from minus infinity to plus infinity, into a value between 0 and 1. A score of 0 gives 50%. A large positive score approaches 100%. A large negative score approaches 0%.
+
+**How to read the weights.** Because the features are standardized, the weights can be compared directly. A weight of `+0.20` on `ret_5d` means that when the 5-day return is one standard deviation above average, the score rises by 0.20. Equivalently, the odds of an up day are multiplied by `e^0.20`, about 1.22.
+
+**How the weights are learned.** The model is fitted by **maximum likelihood**: it adjusts the weights to make the observed outcomes as probable as possible. For each training day, the **log-loss** measures how wrong the prediction was:
+
+```
+loss = -[ y * log(p) + (1 - y) * log(1 - p) ]
+```
+
+If the outcome was 1 and `p` was 0.9, the loss is small. If the outcome was 1 and `p` was 0.1, the loss is large. The training process minimises the total loss across all training days.
+
+**Regularization (the C parameter).** Scikit-learn's version minimises:
+
+```
+0.5 * (sum of squared weights)  +  C * (total log-loss)
+```
+
+The first term is a **penalty** that pulls weights toward zero. The parameter `C` controls the trade-off:
+
+- **Small C** (for example 0.001): strong penalty, weights stay small, the model is simpler and less likely to memorise noise.
+- **Large C** (for example 0.1): weak penalty, weights can grow, the model fits the training data more closely.
+
+The project tries `C` values of 0.001, 0.01 and 0.1 and lets the validation set choose. This is the standard way to avoid **overfitting**, where a model learns the quirks of the training period that will not repeat.
+
+**Balanced class weights.** `class_weight="balanced"` gives each outcome a weight inversely proportional to how common it is:
+
+```
+weight_for_class_c = n_total / (2 * n_class_c)
+```
+
+If up days were 60% of the data, up-day mistakes would count less per day than down-day mistakes, so the model cannot score well just by always guessing "up."
+
+**Solver and iterations.** The default solver (`lbfgs`) is an iterative method that adjusts the weights step by step. `max_iter=5000` gives it up to 5,000 steps to settle. If it does not converge, scikit-learn prints a warning.
+
+**Decision rule.** The model predicts "up" when `probability > 0.5`, otherwise "down."
+
+### 7.6 Step 5: choosing the best setup (validation)
+
+The program builds six candidates: two feature sets (basic, rich) times three regularization strengths. Each candidate is trained on the **training block** (the oldest data, all but the last 500 days in the auto-tuned model).
+
+Each candidate is then scored on the **validation block** (the next 250 days). The highest validation accuracy wins.
+
+Then the winner is graded **once** on the **test block** (the final 250 days). This test score is the honest result that gets printed.
+
+Two things to keep in mind:
+
+- **Selection bias.** Picking the best of six candidates on validation makes the validation score look a little better than it really is. That is why the test score is reported separately.
+- **Sampling noise.** The accuracy on 250 days is itself uncertain. The **standard error** of an accuracy of about 50% on 250 days is:
+
+```
+sqrt(0.5 * 0.5 / 250) = 0.032   (about 3.2 percentage points)
+```
+
+A 95% range is roughly plus or minus 6 points. So a result of 52% is well inside the range you would see from pure chance. The project's conclusion, that the price model is near a coin flip, follows directly from this.
+
+### 7.7 Step 6: refitting and forecasting today
+
+After the winner is chosen, it is **refitted on all the history** (every row that has a known target). This uses the most data for today's forecast. The model then takes today's feature values and returns `predict_proba`, the probability of "up."
+
+### 7.8 The arithmetic, shown step by step
+
+Because logistic regression is a weighted sum, the final probability can be broken into parts that add up exactly. For each feature, the **push** is:
+
+```
+push_j = z_j * w_j      (today's standardized value times its weight)
+```
+
+The score is the sum of all pushes plus the intercept, and the probability is the sigmoid of that score. The program prints this table (the function `show_forecast_math`) and includes an `assert` (a self-check) that confirms the hand-calculated probability matches the library's answer. If they differed, the program would stop.
+
+### 7.9 Evaluating the model over time (walk-forward)
+
+A single test block is one snapshot. A **walk-forward** evaluation gives a more realistic picture. For each of the last N days:
+
+1. Train a model using only data from before that day.
+2. Predict that day's probability.
+3. Record whether the price actually rose the next day.
+
+This is what `--backtest` and `--evaluate` do, and it is run through `forecast_on_date`.
+
+> **Important difference:** `forecast_on_date` uses a **simpler, 2-feature model** (yesterday's return and the 5-day return). It does **not** use the auto-tuned model that produces the headline probability. So the backtest and the evaluation grade the simpler model, not the one in the main forecast. The only exception is the feature-weight chart from `--evaluate`, which shows the auto-tuned model's weights.
+
+The 2-feature model in `forecast_on_date` is trained as follows:
+
+- It uses every trading day up to the chosen date.
+- It drops the final row, because that row's target is whether the price rose on the day *after* the chosen date. That is the outcome the forecast is trying to predict, so it must not be used for training.
+- It requires at least 40 days of history.
+
+### 7.10 The metrics, explained
+
+**Accuracy** is the share of forecasts on the right side of 50%:
+
+```
+accuracy = (number of correct calls) / (number of days)
+```
+
+**Precision** is: of the days the model said "up," how many really rose:
+
+```
+precision = true positives / (days predicted up)
+```
+
+**Recall** is: of the days that really rose, how many the model caught:
+
+```
+recall = true positives / (days that actually rose)
+```
+
+**Brier score** measures the quality of the probabilities, not just the up/down call:
+
+```
+Brier = average of (probability - outcome)^2
+```
+
+It is 0 for perfect forecasts. Always guessing 50% gives `(0.5 - y)^2 = 0.25` every day, so the Brier score is 0.25. Anything above 0.25 is worse than guessing. The verdict words in the program ("excellent", "decent", "poor") use cut-off points of 0.20 and 0.24 chosen in the code. They are rules of thumb, not formal statistical tests.
+
+**Naive baseline.** This is the accuracy you would get by always predicting whichever outcome is most common. Because the outcomes are close to balanced, this is close to 50%. A model must beat this to add any value.
+
+**Calibration bins.** Forecasts are grouped into buckets by their probability (for example 40–60%). In each bucket the program compares the **average predicted probability** with the **observed share that rose.** A well-calibrated model that says "60%" should see about 60% of those days rise. This is a different question from accuracy: a model can be right 52% of the time and still have badly calibrated probabilities.
+
+### 7.11 The other statistics in the project
+
+Some calculations in the project are **descriptive statistics**. They summarise, but do not learn anything:
+
+- **Average score (mean):** the sum of the scores divided by the count.
+- **Spread (sample variance):** the sum of squared distances from the mean, divided by `n - 1`. High spread means the headlines disagree.
+- **Tone:** "bullish" if the average is above +5, "bearish" if below -5, otherwise "neutral." The dead zone around zero stops tiny averages from being treated as a real trend.
+- **Counts:** how many headlines were bullish or bearish, per day and per driver.
+
+### 7.12 The news AI is not a statistical model
+
+The headline scoring is done by a **large language model** (LLM), not by a formula the project trained. The project does not train or fine-tune it. It only:
+
+1. sends the system prompt and one headline,
+2. asks for a JSON reply with an impact score,
+3. parses the JSON and clamps the score to -100..+100.
+
+This is called **zero-shot classification**: the model classifies text it has never been specifically trained on, guided only by instructions. The `temperature` setting of 0.2 makes its answers more consistent, but the scores are still the model's judgment. They have not been checked for calibration, so they should not be treated as probabilities.
+
+### 7.13 The other scripts' models
+
+- **`simple_model.py`:** the same logistic regression with 3 features (yesterday's return, 5-day return, volatility). It splits the data 80% for training and 20% for testing, with no validation step, because it has only one model to compare. It prints every weight and every step of today's calculation.
+- **`experiments.py`:** a fair comparison of 2 feature sets times 3 regularization strengths. It uses 500 days for training, then 250 for validation and 250 for testing. It ranks by validation accuracy and shows the top four with their test scores.
+- **`forecast_on_date`:** a 2-feature logistic regression refitted for each chosen date, using only data up to that date (see section 7.9).
+
+### 7.14 How the pieces fit together
+
+```
+Prices (CSV)
+   |
+   v
+Returns and features  --(basic or rich)-->  feature table  (one row per day)
+   |
+   v
+Standardize (fit on training data only)
+   |
+   v
+Logistic regression, C chosen on validation
+   |
+   v
+Probability of rise tomorrow  --> printed forecast, math table, and charts
+
+Headlines (RSS)
+   |
+   v
+LLM gives each headline a score (-100..+100)
+   |
+   v
+Descriptive stats: counts, average, spread, tone  --> printed verdict
+   |
+   v
+SQLite archive  --> future news-aware model (not built yet)
+```
+
+### 7.15 Why the model is so weak (the statistical reasons)
+
+Several reasons explain why the accuracy stays near 50%:
+
+- **Weak signal.** Past price patterns explain very little of tomorrow's move. Many economists believe that prices already reflect the information available, which leaves little for a simple model to find. This is a widely discussed hypothesis, not a settled result.
+- **Small sample.** Five years of trading days is roughly 1,250 rows. After dropping rows where the rolling windows are incomplete, the rich set has around 1,200. With a standard error of about 3 points at 250 days, small improvements cannot be told apart from luck.
+- **Changing conditions.** Oil markets shift between regimes (calm periods, supply crises, price wars). A pattern that worked in one regime may not work in the next.
+- **Few and simple features.** The models only see past prices and volume. They do not see the news, which is probably where much of the real information lies.
+- **Honest testing.** The project refuses to tune on the test set, so its results are modest. A tuned model would look better on paper, but worse in use.
+
+---
+
+## 8. Why the results are honest (and modest)
 
 Three habits keep the project honest:
 
@@ -466,7 +732,7 @@ The main lever for real improvement is the news. The archive is collecting label
 
 ---
 
-## 8. Known limitations and quirks
+## 9. Known limitations and quirks
 
 - **The price cache never refreshes automatically.** Delete `data/brent_prices.csv` to get newer data.
 - **Free news feeds cover only about the last 3 days.** Old headlines cannot be re-fetched for backtests.
@@ -478,7 +744,7 @@ The main lever for real improvement is the news. The archive is collecting label
 
 ---
 
-## 9. Where to go next
+## 10. Where to go next
 
 - To **run it**: see `README.md`.
 - To **change what news is searched**: edit `DRIVERS` in `oil_ai/config.py`.
